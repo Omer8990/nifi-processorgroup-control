@@ -121,7 +121,7 @@ class NiFiAPI:
         except Exception as e:
             logger.error(f"Error stopping process group {process_group_id}: {e}")
             return None
-    
+    # This way of checking if it finishes is only checking if there are 0 active threads, 
     def is_process_group_running(self, process_group_id: str):
         """Check if any processor in the process group is running"""
         try:
@@ -135,18 +135,55 @@ class NiFiAPI:
             # Assume it's not running if we can't check
             return False
     
+    def get_process_group_status(self, process_group_id: str):
+        """Get detailed status of a process group"""
+        try:
+            status = self._make_request('GET', f'flow/process-groups/{process_group_id}/status')
+            aggregated_status = status['processGroupStatus']['aggregateSnapshot']
+            
+            return {
+                'active_threads': aggregated_status.get('activeThreadCount', 0),
+                'queued_count': aggregated_status.get('queuedCount', 0),
+                'input_count': aggregated_status.get('inputCount', 0),
+                'output_count': aggregated_status.get('outputCount', 0),
+                'bytes_read': aggregated_status.get('bytesRead', 0),
+                'bytes_written': aggregated_status.get('bytesWritten', 0),
+                'errors': aggregated_status.get('errors', 0)
+            }
+        except Exception as e:
+            logger.error(f"Error getting process group status: {e}")
+            return None
+
+    def is_process_group_completed_successfully(self, process_group_id: str):
+        """Check if a process group completed successfully with no errors and no queued data"""
+        status = self.get_process_group_status(process_group_id)
+        
+        if status is None:
+            return False
+        
+        # Check if the group processed data (had input) but now has no active threads,
+        # no queued data, and no errors
+        processed_data = status['input_count'] > 0 or status['output_count'] > 0
+        no_active_work = status['active_threads'] == 0 and status['queued_count'] == 0
+        no_errors = status['errors'] == 0
+        
+        return processed_data and no_active_work and no_errors
+
     def wait_for_process_group_completion(self, process_group_id: str, check_interval: int = 5, timeout: int = 300):
-        """Wait for all processors in a process group to complete execution"""
+        """Wait for a process group to complete execution successfully"""
         start_time = time.time()
         
         while time.time() - start_time < timeout:
-            try:
-                if not self.is_process_group_running(process_group_id):
-                    logger.info(f"Process group {process_group_id} has completed execution")
+            # First check if it's still running
+            if not self.is_process_group_running(process_group_id):
+                # Then check if it completed successfully
+                if self.is_process_group_completed_successfully(process_group_id):
+                    logger.info(f"Process group {process_group_id} completed successfully")
                     return True
-            except Exception as e:
-                logger.error(f"Error checking process group status: {e}")
-                
+                else:
+                    logger.warning(f"Process group {process_group_id} is not running but may have errors or unprocessed data")
+                    return False
+                    
             logger.info(f"Process group {process_group_id} is still running, waiting...")
             time.sleep(check_interval)
         
@@ -254,4 +291,4 @@ with DAG(
     nifi_task >> pyspark_task
     
     
-    # c3bb0070-0196-1000-eb68-0d72e486fc0e
+# c8b97c7d-0196-1000-c32e-ddd6b103147b

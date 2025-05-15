@@ -121,70 +121,217 @@ class NiFiAPI:
         except Exception as e:
             logger.error(f"Error stopping process group {process_group_id}: {e}")
             return None
-    # This way of checking if it finishes is only checking if there are 0 active threads, 
-    def is_process_group_running(self, process_group_id: str):
-        """Check if any processor in the process group is running"""
-        try:
-            status = self._make_request('GET', f'flow/process-groups/{process_group_id}/status')
-            aggregated_status = status['processGroupStatus']['aggregateSnapshot']
-            
-            # Check if there are any active threads in the process group
-            return aggregated_status['activeThreadCount'] > 0
-        except Exception as e:
-            logger.error(f"Error checking if process group is running: {e}")
-            # Assume it's not running if we can't check
-            return False
     
-    def get_process_group_status(self, process_group_id: str):
+    def get_process_group_status(self, process_group_id: str, recursive=True):
         """Get detailed status of a process group"""
         try:
-            status = self._make_request('GET', f'flow/process-groups/{process_group_id}/status')
+            params = {'recursive': str(recursive).lower()}
+            status = self._make_request('GET', f'flow/process-groups/{process_group_id}/status', params=params)
             aggregated_status = status['processGroupStatus']['aggregateSnapshot']
             
             return {
                 'active_threads': aggregated_status.get('activeThreadCount', 0),
                 'queued_count': aggregated_status.get('queuedCount', 0),
+                'queued_bytes': aggregated_status.get('queuedContentSize', 0),
                 'input_count': aggregated_status.get('inputCount', 0),
                 'output_count': aggregated_status.get('outputCount', 0),
                 'bytes_read': aggregated_status.get('bytesRead', 0),
                 'bytes_written': aggregated_status.get('bytesWritten', 0),
-                'errors': aggregated_status.get('errors', 0)
+                'errors': aggregated_status.get('errors', 0),
+                'bulletin_count': aggregated_status.get('bulletinCount', 0)
             }
         except Exception as e:
             logger.error(f"Error getting process group status: {e}")
             return None
-
-    def is_process_group_completed_successfully(self, process_group_id: str):
-        """Check if a process group completed successfully with no errors and no queued data"""
+    
+    def get_bulletins(self, process_group_id: str):
+        """Get bulletins (error messages) for a process group"""
+        try:
+            bulletins = self._make_request('GET', f'flow/process-groups/{process_group_id}/bulletins')
+            return bulletins
+        except Exception as e:
+            logger.error(f"Error getting bulletins for process group {process_group_id}: {e}")
+            return None
+    
+    def get_processor_types(self, process_group_id: str):
+        """Get all processor types in a process group"""
+        try:
+            response = self._make_request('GET', f'flow/process-groups/{process_group_id}/processors')
+            processors = []
+            
+            if response and 'processors' in response:
+                for processor in response['processors']:
+                    processors.append({
+                        'id': processor['component']['id'],
+                        'name': processor['component']['name'],
+                        'type': processor['component']['type'].split('.')[-1]
+                    })
+                    
+            return processors
+        except Exception as e:
+            logger.error(f"Error getting processors for process group {process_group_id}: {e}")
+            return []
+    
+    def get_connection_status(self, process_group_id: str):
+        """Get status of all connections in a process group"""
+        try:
+            response = self._make_request('GET', f'flow/process-groups/{process_group_id}/connections')
+            connections = []
+            
+            if response and 'connections' in response:
+                for connection in response['connections']:
+                    connections.append({
+                        'id': connection['component']['id'],
+                        'name': connection['component']['name'],
+                        'source_name': connection['component']['source']['name'],
+                        'destination_name': connection['component']['destination']['name'],
+                    })
+            
+            return connections
+        except Exception as e:
+            logger.error(f"Error getting connections for process group {process_group_id}: {e}")
+            return []
+    
+    def is_process_group_running(self, process_group_id: str):
+        """Check if any processor in the process group is running"""
         status = self.get_process_group_status(process_group_id)
         
         if status is None:
             return False
         
-        # Check if the group processed data (had input) but now has no active threads,
-        # no queued data, and no errors
-        processed_data = status['input_count'] > 0 or status['output_count'] > 0
-        no_active_work = status['active_threads'] == 0 and status['queued_count'] == 0
-        no_errors = status['errors'] == 0
+        # Check if there are any active threads in the process group
+        return status['active_threads'] > 0
+    
+    def get_all_components_details(self, process_group_id: str):
+        """Get detailed information about all components in a process group"""
+        try:
+            # Get processors
+            processors = self.get_processor_types(process_group_id)
+            
+            # Get connections
+            connections = self.get_connection_status(process_group_id)
+            
+            # Get status
+            status = self.get_process_group_status(process_group_id)
+            
+            # Get bulletins
+            bulletins = self.get_bulletins(process_group_id)
+            
+            return {
+                'processors': processors,
+                'connections': connections,
+                'status': status,
+                'bulletins': bulletins
+            }
+        except Exception as e:
+            logger.error(f"Error getting component details for process group {process_group_id}: {e}")
+            return None
+    
+    def has_expected_terminal_processors(self, process_group_id: str):
+        """Check if the process group has the expected terminal processors (ExecuteSQL or PutDatabaseRecord)"""
+        processors = self.get_processor_types(process_group_id)
         
-        return processed_data and no_active_work and no_errors
-
-    def wait_for_process_group_completion(self, process_group_id: str, check_interval: int = 5, timeout: int = 300):
-        """Wait for a process group to complete execution successfully"""
+        # Check if the flow has at least one of the expected terminal processors
+        terminal_processors = ['ExecuteSQL', 'PutDatabaseRecord']
+        has_terminal = any(
+            any(p_type in proc['type'] for p_type in terminal_processors)
+            for proc in processors
+        )
+        
+        return has_terminal
+    
+    def has_excessive_errors(self, process_group_id: str, max_errors=5):
+        """Check if the process group has excessive errors"""
+        status = self.get_process_group_status(process_group_id)
+        
+        if status is None:
+            return False
+        
+        return status['errors'] > max_errors
+    
+    def wait_for_process_group_completion(self, process_group_id: str, check_interval: int = 10, 
+                                         timeout: int = 300, max_errors: int = 5,
+                                         stability_period: int = 30):
+        """
+        Wait for a process group to complete execution successfully
+        
+        Args:
+            process_group_id: The ID of the process group
+            check_interval: How often to check status (seconds)
+            timeout: Maximum time to wait (seconds)
+            max_errors: Maximum allowable errors before stopping
+            stability_period: Time with no changes to confirm completion (seconds)
+        """
         start_time = time.time()
         
+        # First, check if flow has expected terminal processors
+        has_terminal_processors = self.has_expected_terminal_processors(process_group_id)
+        if not has_terminal_processors:
+            logger.warning(f"Process group {process_group_id} does not have expected terminal processors")
+        
+        # Variables to track stability
+        last_activity_time = time.time()
+        last_status = None
+        
         while time.time() - start_time < timeout:
-            # First check if it's still running
-            if not self.is_process_group_running(process_group_id):
-                # Then check if it completed successfully
-                if self.is_process_group_completed_successfully(process_group_id):
-                    logger.info(f"Process group {process_group_id} completed successfully")
-                    return True
-                else:
-                    logger.warning(f"Process group {process_group_id} is not running but may have errors or unprocessed data")
-                    return False
-                    
-            logger.info(f"Process group {process_group_id} is still running, waiting...")
+            # Check if there are excessive errors
+            if self.has_excessive_errors(process_group_id, max_errors):
+                logger.error(f"Process group {process_group_id} has excessive errors (>{max_errors}). Stopping flow.")
+                self.stop_process_group(process_group_id)
+                return False
+            
+            # Get current status
+            current_status = self.get_process_group_status(process_group_id)
+            
+            if current_status is None:
+                logger.error(f"Could not get status for process group {process_group_id}")
+                return False
+            
+            # Check if there is any activity (active threads or queued data)
+            is_active = int(current_status['active_threads']) > 0 or int(current_status['queued_count']) > 0
+            
+            # Check for changes since last status check
+            status_changed = False
+            if last_status is not None:
+                # Check if any of these metrics changed
+                for key in ['input_count', 'output_count', 'bytes_read', 'bytes_written']:
+                    if current_status[key] != last_status[key]:
+                        status_changed = True
+                        break
+            
+            # Update last status
+            last_status = current_status
+            
+            # If there's activity or status changed, update the last activity time
+            if is_active or status_changed:
+                last_activity_time = time.time()
+                logger.info(f"Process group {process_group_id} is active or had changes, resetting stability timer")
+                
+                # Log details about the current status
+                logger.info(f"Status: Active threads={current_status['active_threads']}, "
+                           f"Queued items={current_status['queued_count']}, "
+                           f"Input={current_status['input_count']}, "
+                           f"Output={current_status['output_count']}, "
+                           f"Errors={current_status['errors']}")
+            else:
+                # No activity and no changes
+                inactive_time = time.time() - last_activity_time
+                logger.info(f"Process group {process_group_id} is inactive for {inactive_time:.1f} seconds")
+                
+                # If the flow has been stable (inactive) for the stability period
+                if inactive_time >= stability_period:
+                    # For flows that processed data (had input or output)
+                    if current_status['input_count'] > 0 or current_status['output_count'] > 0:
+                        if current_status['errors'] == 0:
+                            logger.info(f"Process group {process_group_id} completed successfully")
+                            return True
+                        else:
+                            logger.warning(f"Process group {process_group_id} completed but had {current_status['errors']} errors")
+                            return False
+                    else:
+                        logger.warning(f"Process group {process_group_id} is inactive but did not process any data")
+                        return False
+            
             time.sleep(check_interval)
         
         logger.warning(f"Timeout reached while waiting for process group {process_group_id} to complete")
@@ -204,6 +351,12 @@ def run_nifi_process_group(**kwargs):
     # Get NiFi connection ID from Airflow Variables or use default
     nifi_connection_id = Variable.get("nifi_connection_id", default_var="nifi_default")
     
+    # Get configuration parameters from Airflow Variables or use defaults
+    check_interval = int(Variable.get("nifi_check_interval", default_var="10"))
+    timeout = int(Variable.get("nifi_timeout", default_var="300"))
+    max_errors = int(Variable.get("nifi_max_errors", default_var="5"))
+    stability_period = int(Variable.get("nifi_stability_period", default_var="30"))
+    
     logger.info(f"Starting NiFi process group: {process_group_id}")
     
     nifi = NiFiAPI(connection_id=nifi_connection_id)
@@ -214,12 +367,18 @@ def run_nifi_process_group(**kwargs):
         
         # Wait for process group to complete
         logger.info("Waiting for process group to complete...")
-        success = nifi.wait_for_process_group_completion(process_group_id)
+        success = nifi.wait_for_process_group_completion(
+            process_group_id,
+            check_interval=check_interval,
+            timeout=timeout,
+            max_errors=max_errors,
+            stability_period=stability_period
+        )
         
         if success:
             logger.info(f"Process group {process_group_id} completed successfully")
         else:
-            logger.warning(f"Process group {process_group_id} did not complete within the timeout period")
+            logger.warning(f"Process group {process_group_id} did not complete successfully")
         
         # Store the success status in XCom
         kwargs['ti'].xcom_push(key='nifi_success', value=success)
@@ -289,6 +448,3 @@ with DAG(
     
     # Set task dependencies
     nifi_task >> pyspark_task
-    
-    
-# c8b97c7d-0196-1000-c32e-ddd6b103147b

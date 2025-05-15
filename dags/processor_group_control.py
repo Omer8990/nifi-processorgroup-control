@@ -121,19 +121,6 @@ class NiFiAPI:
         except Exception as e:
             logger.error(f"Error stopping process group {process_group_id}: {e}")
             return None
-    # This way of checking if it finishes is only checking if there are 0 active threads, 
-    def is_process_group_running(self, process_group_id: str):
-        """Check if any processor in the process group is running"""
-        try:
-            status = self._make_request('GET', f'flow/process-groups/{process_group_id}/status')
-            aggregated_status = status['processGroupStatus']['aggregateSnapshot']
-            
-            # Check if there are any active threads in the process group
-            return aggregated_status['activeThreadCount'] > 0
-        except Exception as e:
-            logger.error(f"Error checking if process group is running: {e}")
-            # Assume it's not running if we can't check
-            return False
     
     def get_process_group_status(self, process_group_id: str):
         """Get detailed status of a process group"""

@@ -154,42 +154,114 @@ class NiFiAPI:
             logger.error(f"Error getting process group status: {e}")
             return None
 
-    def is_process_group_completed_successfully(self, process_group_id: str):
-        """Check if a process group completed successfully with no errors and no queued data"""
+    def is_process_group_completed_successfully(self, process_group_id: str, prev_status=None):
+        """
+        Enhanced method to check if a process group completed successfully with no errors
+        
+        This implementation:
+        1. Tracks changes in input/output counts to detect progress
+        2. Considers a flow successful when:
+        - No active threads remain
+        - No errors are present
+        - Either input/output counts > 0 (data was processed)
+        - OR input/output counts haven't changed in consecutive checks (processing stalled)
+        """
         status = self.get_process_group_status(process_group_id)
         
         if status is None:
             return False
         
-        # Check if the group processed data (had input) but now has no active threads,
-        # no queued data, and no errors
-        processed_data = status['input_count'] > 0 or status['output_count'] > 0
-        no_active_work = status['active_threads'] == 0 and status['queued_count'] == 0
+        # Check if there are no active threads (no more processing happening)
+        no_active_threads = status['active_threads'] == 0
+        
+        # Check if there are no errors
         no_errors = status['errors'] == 0
         
-        return processed_data and no_active_work and no_errors
+        # Check if data was processed
+        processed_data = status['input_count'] > 0 or status['output_count'] > 0
+        
+        # If we have previous status, check if counts changed
+        status_unchanged = False
+        if prev_status:
+            input_unchanged = status['input_count'] == prev_status['input_count']
+            output_unchanged = status['output_count'] == prev_status['output_count']
+            queue_unchanged = status['queued_count'] == prev_status['queued_count']
+            status_unchanged = input_unchanged and output_unchanged and queue_unchanged
+        
+        # Success is when:
+        # 1. No active threads (not processing)
+        # 2. No errors
+        # 3. Either data was processed OR status hasn't changed from previous check
+        return no_active_threads and no_errors and (processed_data or status_unchanged)
 
     def wait_for_process_group_completion(self, process_group_id: str, check_interval: int = 5, timeout: int = 300):
-        """Wait for a process group to complete execution successfully"""
+        """Enhanced wait method that tracks status changes between checks"""
         start_time = time.time()
+        prev_status = None
+        unchanged_count = 0
         
         while time.time() - start_time < timeout:
-            # First check if it's still running
-            if not self.is_process_group_running(process_group_id):
-                # Then check if it completed successfully
-                if self.is_process_group_completed_successfully(process_group_id):
+            # Get current status
+            status = self.get_process_group_status(process_group_id)
+            
+            if status is None:
+                logger.warning(f"Could not get status for process group {process_group_id}")
+                time.sleep(check_interval)
+                continue
+            
+            # Check if there are no active threads
+            if status['active_threads'] == 0:
+                # Check if the completion was successful
+                if self.is_process_group_completed_successfully(process_group_id, prev_status):
                     logger.info(f"Process group {process_group_id} completed successfully")
-                    return True
-                else:
-                    logger.warning(f"Process group {process_group_id} is not running but may have errors or unprocessed data")
-                    return False
                     
-            logger.info(f"Process group {process_group_id} is still running, waiting...")
+                    # Log final stats
+                    logger.info(f"Final stats - Input: {status['input_count']}, " 
+                            f"Output: {status['output_count']}, "
+                            f"Queued: {status['queued_count']}, "
+                            f"Errors: {status['errors']}")
+                    return True
+                
+                # Check if status is unchanged between checks
+                if prev_status:
+                    input_unchanged = status['input_count'] == prev_status['input_count']
+                    output_unchanged = status['output_count'] == prev_status['output_count']
+                    queue_unchanged = status['queued_count'] == prev_status['queued_count']
+                    
+                    if input_unchanged and output_unchanged and queue_unchanged:
+                        unchanged_count += 1
+                        
+                        # If stats haven't changed for 3 consecutive checks and no active threads,
+                        # we consider the flow complete
+                        if unchanged_count >= 3:
+                            logger.info(f"Process group {process_group_id} appears complete - "
+                                    f"no activity for {unchanged_count} consecutive checks")
+                            
+                            # Check for errors before declaring success
+                            if status['errors'] > 0:
+                                logger.warning(f"Process completed with {status['errors']} errors")
+                                return False
+                            return True
+                    else:
+                        # Reset counter if stats changed
+                        unchanged_count = 0
+                
+            else:
+                # Reset unchanged count if there are active threads
+                unchanged_count = 0
+                    
+            # Store current status for next comparison
+            prev_status = status
+            
+            logger.info(f"Process group status - Active Threads: {status['active_threads']}, "
+                    f"Input: {status['input_count']}, "
+                    f"Output: {status['output_count']}, "
+                    f"Queued: {status['queued_count']}")
+            
             time.sleep(check_interval)
         
         logger.warning(f"Timeout reached while waiting for process group {process_group_id} to complete")
         return False
-
 
 def run_nifi_process_group(**kwargs):
     """
@@ -289,6 +361,3 @@ with DAG(
     
     # Set task dependencies
     nifi_task >> pyspark_task
-    
-    
-# c8b97c7d-0196-1000-c32e-ddd6b103147b

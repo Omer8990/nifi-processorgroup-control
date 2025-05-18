@@ -348,3 +348,11 @@ with DAG(
     
     # Set task dependencies
     nifi_task >> pyspark_task
+
+
+
+#  is_process_group_completed_successfully defines success as:
+
+# No active threads (status['active_threads'] == 0)
+# No errors (status['errors'] == 0)
+# AND (data was processed (status['input_count'] > 0 or status['output_count'] > 0) OR status was unchanged from a previous check).

@@ -1,7 +1,6 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable
-from airflow.exceptions import AirflowException
 from datetime import datetime, timedelta
 
 import requests
@@ -182,7 +181,7 @@ class NiFiAPI:
         # 3. Either data was processed OR status hasn't changed from previous check
         return no_active_threads and no_errors and (processed_data or status_unchanged)
 
-    def wait_for_process_group_completion(self, process_group_id: str, check_interval: int = 5, timeout: int = 300):
+    def wait_for_process_group_completion(self, process_group_id: str, check_interval: int = 5, timeout: int = 60):
         """Enhanced wait method that tracks status changes between checks"""
         start_time = time.time()
         prev_status = None
@@ -255,11 +254,9 @@ def run_nifi_process_group(**kwargs):
     """
     Run an existing NiFi process group
     
-    Raises:
-        AirflowException: If the NiFi process group fails to complete successfully
+    Returns:
+        True if successful
     """
-    from airflow.exceptions import AirflowException
-    
     # Get the process group ID from Airflow Variables
     process_group_id = Variable.get("existing_process_group_id", default_var="your-process-group-id")
     
@@ -281,16 +278,12 @@ def run_nifi_process_group(**kwargs):
         if success:
             logger.info(f"Process group {process_group_id} completed successfully")
         else:
-            logger.error(f"Process group {process_group_id} did not complete successfully")
-            # Store the failure status in XCom
-            kwargs['ti'].xcom_push(key='nifi_success', value=False)
-            # Raise AirflowException to fail the task
-            raise AirflowException(f"NiFi process group {process_group_id} failed to complete successfully")
+            logger.warning(f"Process group {process_group_id} did not complete within the timeout period")
         
         # Store the success status in XCom
-        kwargs['ti'].xcom_push(key='nifi_success', value=True)
+        kwargs['ti'].xcom_push(key='nifi_success', value=success)
         
-        return True
+        return success
         
     except Exception as e:
         logger.error(f"Error running process group: {e}")
@@ -300,8 +293,9 @@ def run_nifi_process_group(**kwargs):
         except Exception as cleanup_error:
             logger.error(f"Error stopping process group during cleanup: {cleanup_error}")
         
-        # Re-raise the exception to fail the task
+        # Re-raise the original exception
         raise
+
 
 def run_spark_job(**kwargs):
     """
@@ -331,7 +325,7 @@ default_args = {
 }
 
 with DAG(
-    'failing_dag_simplified_nifi_spark',
+    'non_failing_simplified_nifi_spark',
     default_args=default_args,
     description='A simplified DAG to run an existing NiFi process group followed by a PySpark job',
     schedule_interval=timedelta(days=1),

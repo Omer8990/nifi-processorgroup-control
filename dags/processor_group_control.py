@@ -282,13 +282,13 @@ def run_nifi_process_group(**kwargs):
             logger.info(f"Process group {process_group_id} completed successfully")
         else:
             logger.error(f"Process group {process_group_id} did not complete successfully")
-            # Store the failure status in XCom
-            kwargs['ti'].xcom_push(key='nifi_success', value=False)
+            # Store the failure status in XCom - not needed if using airflowExceptions
+            # kwargs['ti'].xcom_push(key='nifi_success', value=False)
             # Raise AirflowException to fail the task
             raise AirflowException(f"NiFi process group {process_group_id} failed to complete successfully")
         
-        # Store the success status in XCom
-        kwargs['ti'].xcom_push(key='nifi_success', value=True)
+        # Store the success status in XCom -  not needed
+        # kwargs['ti'].xcom_push(key='nifi_success', value=True)
         
         return True
         
@@ -326,7 +326,7 @@ default_args = {
     'depends_on_past': False,
     'email_on_failure': False,
     'email_on_retry': False,
-    'retries': 1,
+    'retries': 3,
     'retry_delay': timedelta(minutes=5),
 }
 

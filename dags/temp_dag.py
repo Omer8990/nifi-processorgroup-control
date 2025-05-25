@@ -1,6 +1,7 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable
+from airflow.exceptions import AirflowException
 from datetime import datetime, timedelta
 
 import requests
@@ -13,24 +14,29 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class NiFiAPI:
-    def __init__(self, connection_id: str = None):
+    def __init__(self, connection_id=None):
         """Initialize NiFi API client using Airflow Variable for connection settings"""
-        # Get NiFi connection info from Airflow Variables or use default
-        connection_id = connection_id or "nifi_default"
+        # Always use connection_id approach for consistency
+        connection_id = connection_id or "nifi_connection"
+        
         try:
+            # Get NiFi connection info from Airflow Variables
             connection_info = Variable.get(connection_id, deserialize_json=True)
-            self.base_url = connection_info.get("base_url", "http://nifi-standalone:8080/nifi-api/")
+            
+            # Required settings
+            self.base_url = connection_info.get("base_url")
+            if not self.base_url:
+                raise ValueError(f"Missing required 'base_url' in {connection_id} variable")
+                
+            # Optional settings with defaults
             self.auth_type = connection_info.get("auth_type", "none")  # none, token, basic
             self.token = connection_info.get("token")
             self.username = connection_info.get("username")
             self.password = connection_info.get("password")
-        except (KeyError, json.JSONDecodeError):
-            logger.warning(f"Could not find or parse {connection_id} variable, using default settings")
-            self.base_url = "http://nifi-standalone:8080/nifi-api/"
-            self.auth_type = "none"
-            self.token = None
-            self.username = None
-            self.password = None
+            
+        except (KeyError, json.JSONDecodeError) as e:
+            logger.error(f"Could not find or parse {connection_id} variable: {e}")
+            raise AirflowException(f"Invalid or missing {connection_id} configuration")
         
         # Ensure base_url ends with a slash
         if not self.base_url.endswith('/'):
@@ -43,7 +49,7 @@ class NiFiAPI:
         if self.auth_type == "token" and self.token:
             self.headers['Authorization'] = f'Bearer {self.token}'
         
-        logger.info(f"Initializing NiFi API client with base URL: {self.base_url}")
+        logger.info(f"Initialized NiFi API client with base URL: {self.base_url}")
         
     def _make_request(self, method: str, endpoint: str, data=None, params=None):
         """Make HTTP request to NiFi API with error handling"""
@@ -105,7 +111,7 @@ class NiFiAPI:
             return response
         except Exception as e:
             logger.error(f"Error starting process group {process_group_id}: {e}")
-            return None
+            raise AirflowException(f"Failed to start NiFi process group {process_group_id}: {e}")
     
     def stop_process_group(self, process_group_id: str):
         """Stop all components in a process group"""
@@ -139,7 +145,7 @@ class NiFiAPI:
             }
         except Exception as e:
             logger.error(f"Error getting process group status: {e}")
-            return None
+            raise AirflowException(f"Failed to get status for NiFi process group {process_group_id}: {e}")
 
     def is_process_group_completed_successfully(self, process_group_id: str, prev_status=None):
         """
@@ -181,7 +187,7 @@ class NiFiAPI:
         # 3. Either data was processed OR status hasn't changed from previous check
         return no_active_threads and no_errors and (processed_data or status_unchanged)
 
-    def wait_for_process_group_completion(self, process_group_id: str, check_interval: int = 5, timeout: int = 60):
+    def wait_for_process_group_completion(self, process_group_id: str, check_interval: int = 5, timeout: int = 300):
         """Enhanced wait method that tracks status changes between checks"""
         start_time = time.time()
         prev_status = None
@@ -254,17 +260,18 @@ def run_nifi_process_group(**kwargs):
     """
     Run an existing NiFi process group
     
-    Returns:
-        True if successful
+    Raises:
+        AirflowException: If the NiFi process group fails to complete successfully
     """
     # Get the process group ID from Airflow Variables
-    process_group_id = Variable.get("existing_process_group_id", default_var="your-process-group-id")
+    process_group_id = Variable.get("nifi_process_group_id")
     
-    # Get NiFi connection ID from Airflow Variables or use default
-    nifi_connection_id = Variable.get("nifi_connection_id", default_var="nifi_default")
+    # Get NiFi connection ID from DAG config or use default
+    nifi_connection_id = kwargs.get('nifi_connection_id', 'nifi_connection')
     
     logger.info(f"Starting NiFi process group: {process_group_id}")
     
+    # Initialize NiFi API client with connection details from Airflow variables
     nifi = NiFiAPI(connection_id=nifi_connection_id)
     
     try:
@@ -275,15 +282,12 @@ def run_nifi_process_group(**kwargs):
         logger.info("Waiting for process group to complete...")
         success = nifi.wait_for_process_group_completion(process_group_id)
         
-        if success:
-            logger.info(f"Process group {process_group_id} completed successfully")
-        else:
-            logger.warning(f"Process group {process_group_id} did not complete within the timeout period")
+        if not success:
+            logger.error(f"Process group {process_group_id} did not complete successfully")
+            raise AirflowException(f"NiFi process group {process_group_id} failed to complete successfully")
         
-        # Store the success status in XCom
-        kwargs['ti'].xcom_push(key='nifi_success', value=success)
-        
-        return success
+        logger.info(f"Process group {process_group_id} completed successfully")
+        return True
         
     except Exception as e:
         logger.error(f"Error running process group: {e}")
@@ -293,9 +297,8 @@ def run_nifi_process_group(**kwargs):
         except Exception as cleanup_error:
             logger.error(f"Error stopping process group during cleanup: {cleanup_error}")
         
-        # Re-raise the original exception
+        # Re-raise the exception to fail the task
         raise
-
 
 def run_spark_job(**kwargs):
     """
@@ -320,14 +323,14 @@ default_args = {
     'depends_on_past': False,
     'email_on_failure': False,
     'email_on_retry': False,
-    'retries': 1,
+    'retries': 3,
     'retry_delay': timedelta(minutes=5),
 }
 
 with DAG(
-    'non_failing_simplified_nifi_spark',
+    'nifi_spark_etl_pipeline',
     default_args=default_args,
-    description='A simplified DAG to run an existing NiFi process group followed by a PySpark job',
+    description='A DAG to run an existing NiFi process group followed by a PySpark job',
     schedule_interval=timedelta(days=1),
     start_date=datetime(2023, 1, 1),
     catchup=False,
@@ -337,6 +340,7 @@ with DAG(
     nifi_task = PythonOperator(
         task_id='run_nifi_process_group',
         python_callable=run_nifi_process_group,
+        op_kwargs={'nifi_connection_id': 'nifi_connection'},
         provide_context=True,
     )
     
